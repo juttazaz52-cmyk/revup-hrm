@@ -13,3 +13,9 @@ Delete hrm.sqlite to reset to seed data. node shots.js = smoke test + screenshot
 ## v3 (Phase 1): self-service, team leads, leave, approvals
 Roles: admin, manager (HR), teamlead, employee. Logins: bilal/Lead@2026 (team lead), ali, hira, usman / Agent@2026.
 Backup of previous version: server.v2.js + hrm.v2.sqlite. If node_modules is missing: PUPPETEER_SKIP_DOWNLOAD=1 npm ci
+
+## Production (v4)
+Env: NODE_ENV=production, DB_PATH, SESSION_SECRET, ADMIN_PASSWORD (required); AYESHA_TEMP_PASSWORD, HAFI_TEMP_PASSWORD (optional seeds). See .env.example and render.yaml.
+In production an empty DB is seeded with admin (+ ayesha, hafi if set), all forced to change password on first login. No sample data.
+Security: sessions stored in SQLite, secure/httpOnly cookies, CSRF tokens, helmet headers, login rate limit (10 / 15 min / IP), atomic DB writes. /health for health checks. Settings -> Download backup.
+Seed env vars only matter on first boot (empty DB); remove them from Render after first login.

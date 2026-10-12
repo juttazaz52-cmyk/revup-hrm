@@ -1,6 +1,10 @@
 const express=require('express'),session=require('express-session'),bcrypt=require('bcryptjs'),fs=require('fs'),path=require('path'),initSqlJs=require('sql.js');
-const DB_FILE=path.join(__dirname,'hrm.sqlite'),PORT=process.env.PORT||3100;
-let db;const save=()=>fs.writeFileSync(DB_FILE,Buffer.from(db.export()));
+const crypto=require('crypto'),helmet=require('helmet'),{rateLimit}=require('express-rate-limit');
+const PROD=process.env.NODE_ENV==='production',DB_FILE=process.env.DB_PATH||path.join(__dirname,'hrm.sqlite'),PORT=process.env.PORT||3100;
+if(PROD)for(const k of ['SESSION_SECRET','ADMIN_PASSWORD'])if(!process.env[k]){console.error('Missing required env var '+k);process.exit(1)}
+fs.mkdirSync(path.dirname(DB_FILE),{recursive:true});
+// atomic write: write to temp file then rename over the real one
+let db;const save=()=>{const tmp=DB_FILE+'.tmp';fs.writeFileSync(tmp,Buffer.from(db.export()));fs.renameSync(tmp,DB_FILE)};
 const all=(s,p=[])=>{const st=db.prepare(s);st.bind(p);const r=[];while(st.step())r.push(st.getAsObject());st.free();return r};
 const get=(s,p=[])=>all(s,p)[0];
 const run=(s,p=[])=>{db.run(s,p);const id=get('select last_insert_rowid() id').id;save();return id};
@@ -44,6 +48,14 @@ create table if not exists payslips(id integer primary key,run_id integer,employ
  db.run("create table if not exists leave_types(id integer primary key,name text,allowance real,paid integer default 1)");
  db.run("create table if not exists requests(id integer primary key,employee_id integer,kind text,leave_type_id integer,start_date text,end_date text,half_day integer default 0,days real,hours real,reason text,status text,tl_by text,tl_comment text,tl_at text,hr_by text,hr_comment text,hr_at text,created_at text)");
  if(!get('select id from leave_types limit 1'))[['Casual',10,1],['Sick',8,1],['Annual',14,1],['Unpaid',0,0]].forEach(l=>db.run('insert into leave_types(name,allowance,paid) values(?,?,?)',l));
+ db.run('create table if not exists sessions(sid text primary key,sess text,expires integer)');
+ if(PROD){if(!get('select id from users limit 1')){
+  db.run("insert or ignore into settings values('currency','PKR'),('company','RevUp Global')");
+  db.run("insert into users(username,password_hash,role,name,must_change) values('admin',?,'admin','Administrator',1)",[bcrypt.hashSync(process.env.ADMIN_PASSWORD,10)]);
+  if(process.env.AYESHA_TEMP_PASSWORD)db.run("insert into users(username,password_hash,role,name,must_change) values('ayesha',?,'manager','Ayesha Kanwal',1)",[bcrypt.hashSync(process.env.AYESHA_TEMP_PASSWORD,10)]);
+  if(process.env.HAFI_TEMP_PASSWORD){db.run("insert into employees(name,position,department,status,hire_date) values('Hafi Waqas Khan','Team Lead','Operations','permanent',?)",[today()]);const eid=all('select last_insert_rowid() id')[0].id;
+   db.run("insert into users(username,password_hash,role,name,employee_id,must_change) values('hafi',?,'teamlead','Hafi Waqas Khan',?,1)",[bcrypt.hashSync(process.env.HAFI_TEMP_PASSWORD,10),eid])}
+  console.log('Production database initialised (no sample data)')}save();return}
  if(!get('select id from users limit 1')){
   db.run("insert into users(username,password_hash,role,name) values('admin',?,'admin','Azaz Tahir')",[bcrypt.hashSync('RevUp@2026',10)]);
   db.run("insert into users(username,password_hash,role,name) values('manager',?,'manager','Floor Manager')",[bcrypt.hashSync('Manager@2026',10)]);
@@ -61,7 +73,17 @@ create table if not exists payslips(id integer primary key,run_id integer,employ
   db.run("update employees set team_lead_id=3 where id in(1,4,5,6)");
  }save();}
 const app=express();app.use(express.urlencoded({extended:true}));app.use('/public',express.static(path.join(__dirname,'public')));
-app.use(session({secret:process.env.SESSION_SECRET||'revup-hrm-'+Math.random(),resave:false,saveUninitialized:false}));
+class SqlStore extends session.Store{get(sid,cb){try{const r=get('select sess,expires from sessions where sid=?',[sid]);if(!r||r.expires<Date.now())return cb(null,null);cb(null,JSON.parse(r.sess))}catch(e){cb(e)}}
+ set(sid,s,cb){try{const exp=s.cookie?.expires?new Date(s.cookie.expires).getTime():Date.now()+864e5;db.run('insert or replace into sessions values(?,?,?)',[sid,JSON.stringify(s),exp]);db.run('delete from sessions where expires<?',[Date.now()]);save();cb&&cb(null)}catch(e){cb&&cb(e)}}
+ destroy(sid,cb){try{db.run('delete from sessions where sid=?',[sid]);save();cb&&cb(null)}catch(e){cb&&cb(e)}}}
+app.set('trust proxy',1);app.disable('x-powered-by');
+app.use(helmet({contentSecurityPolicy:{directives:{'script-src-attr':["'unsafe-inline'"],'style-src':["'self'","'unsafe-inline'"],'upgrade-insecure-requests':PROD?[]:null}},hsts:PROD}));
+app.get('/health',(req,res)=>{try{get('select 1 ok');res.json({ok:true})}catch(e){res.status(500).json({ok:false})}});
+app.use(session({store:new SqlStore(),name:'revup.sid',secret:process.env.SESSION_SECRET||'dev-only-secret-change-me',resave:false,saveUninitialized:false,cookie:{httpOnly:true,sameSite:'lax',secure:PROD,maxAge:12*3600e3}}));
+// CSRF: per-session token, injected into every POST form, checked on every POST
+app.use((req,res,next)=>{if(!req.session.csrf)req.session.csrf=crypto.randomBytes(24).toString('hex');const tok=req.session.csrf,send=res.send.bind(res);
+ res.send=b=>send(typeof b==='string'?b.replace(/<form([^>]*method=post[^>]*)>/gi,m=>m+`<input type=hidden name=_csrf value="${tok}">`):b);
+ if(req.method==='POST'&&req.body?._csrf!==tok)return res.status(403).send('Invalid or expired form token. Go back, refresh the page and try again.');next()});
 const auth=(req,res,next)=>req.session.user?next():res.redirect('/login');
 const admin=(req,res,next)=>req.session.user?.role==='admin'?next():res.status(403).send(page(req,'Forbidden','<div class=card>Admins only.</div>'));
 const CSS=`:root{--g:#3A6B60;--m:#84C3A7;--l:#eef7f2}*{box-sizing:border-box}body{margin:0;font-family:system-ui,Segoe UI,Arial;background:var(--l);color:#1d2b27}
@@ -85,7 +107,8 @@ const sel=(n,opts,v)=>`<select name=${n}>${opts.map(o=>`<option ${o==v?'selected
 app.get('/login',(req,res)=>res.send(`<!doctype html><html><head><title>Login · RevUp Global HRM</title><link rel=icon href=/public/logo.png><style>${CSS}body{display:grid;place-items:center;min-height:100vh;background:linear-gradient(135deg,#3A6B60,#84C3A7)}</style></head><body>
 <form method=post class=card style="width:340px;text-align:center"><img src=/public/logo.png style="max-width:200px"><h2 style=color:#3A6B60>RevUp Global HRM</h2>${req.query.e?'<p style=color:#b04a4a>Invalid username or password</p>':''}
 <input name=username placeholder=Username required><br><br><input name=password type=password placeholder=Password required><br><br><button style=width:100%>Sign in</button></form></body></html>`));
-app.post('/login',(req,res)=>{const u=get('select * from users where username=?',[req.body.username]);if(u&&bcrypt.compareSync(req.body.password||'',u.password_hash)){req.session.user={id:u.id,name:u.name,role:u.role,username:u.username,employee_id:u.employee_id,must_change:!!u.must_change};return res.redirect('/')}res.redirect('/login?e=1')});
+const loginLimiter=rateLimit({windowMs:15*60e3,limit:10,standardHeaders:'draft-7',legacyHeaders:false,handler:(req,res)=>res.status(429).send('Too many login attempts. Try again in 15 minutes.')});
+app.post('/login',loginLimiter,(req,res)=>{const u=get('select * from users where username=?',[req.body.username]);if(u&&bcrypt.compareSync(req.body.password||'',u.password_hash)){return req.session.regenerate(()=>{req.session.user={id:u.id,name:u.name,role:u.role,username:u.username,employee_id:u.employee_id,must_change:!!u.must_change};res.redirect('/')})}res.redirect('/login?e=1')});
 app.get('/logout',(req,res)=>req.session.destroy(()=>res.redirect('/login')));
 app.use(auth);
 app.use((req,res,next)=>{if(!req.session.user.must_change||['/change-password','/logout'].includes(req.path))return next();res.redirect('/change-password')});
@@ -174,6 +197,7 @@ app.get('/attendance/grid',(req,res)=>{const m=/^\d{4}-\d{2}$/.test(req.query.mo
  res.send(page(req,'Attendance grid '+m,`<div class=card><form class=f><input type=month name=month value="${m}"><button>Go</button><a class="btn m" href="/attendance">Daily marking</a></form><p><small>${ATT.map(a=>`<span class=tag style="background:${col[a]}">${ABBR[a]} = ${a}</span>`).join(' ')} · click a day to edit</small></p></div>
  <div class=card style=overflow-x:auto><table style=font-size:12px><tr><th>Employee</th>${days.map(d=>`<th style="padding:4px;text-align:center"><a style=color:#fff href="/attendance?date=${d}">${+d.slice(8)}</a></th>`).join('')}<th>P</th><th>A</th><th>L</th><th>H</th><th>Lt</th><th>OT</th></tr>
  ${E.map(e=>{const r=days.map(d=>A[e.id+'|'+d]),c=s=>r.filter(x=>x?.status===s).length;return `<tr><td style=white-space:nowrap>${esc(e.name)}</td>${r.map(a=>`<td style="padding:4px;text-align:center;background:${a?col[a.status]:''}" title="${a?a.status+' '+(a.check_in||'')+'-'+(a.check_out||'')+(a.ot_hours?' OT '+a.ot_hours+'h':''):''}">${a?ABBR[a.status]:''}</td>`).join('')}<td>${c('present')}</td><td>${c('absent')}</td><td>${c('leave')}</td><td>${c('half-day')}</td><td>${c('late')}</td><td>${r.reduce((t,a)=>t+(+a?.ot_hours||0),0)}</td></tr>`}).join('')}</table></div>`))});
+app.get('/backup',admin,(req,res)=>{res.setHeader('Content-Type','application/octet-stream');res.setHeader('Content-Disposition',`attachment; filename="revup-hrm-backup-${new Date().toISOString().slice(0,16).replace(/[:T]/g,'-')}.sqlite"`);res.send(Buffer.from(db.export()))});
 app.post('/settings/leave',admin,(req,res)=>{all('select id from leave_types').forEach(({id})=>run('update leave_types set name=?,allowance=?,paid=? where id=?',[req.body['n_'+id],+req.body['a_'+id]||0,req.body['p_'+id]==='0'?0:1,id]));res.redirect('/settings')});
 function balTable(eid){return `<table><tr><th>Type</th><th>Allowance</th><th>Used</th><th>Pending</th><th>Remaining</th></tr>${balances(eid,today().slice(0,4)).map(b=>`<tr><td>${esc(b.name)}${b.paid?'':' <small>(unpaid)</small>'}</td><td>${b.allowance||'—'}</td><td>${b.used}</td><td>${b.pending}</td><td><b>${b.allowance?b.allowance-b.used:'—'}</b></td></tr>`).join('')}</table>`}
 const reqRows=(rs,showEmp)=>`<table><tr>${showEmp?'<th>Employee</th>':''}<th>Request</th><th>Dates</th><th>Reason</th><th>Status</th><th>Team lead</th><th>HR</th></tr>${rs.map(r=>`<tr>${showEmp?`<td>${esc(r.ename)}</td>`:''}<td>${r.kind==='leave'?esc(r.lname)+' leave · '+r.days+' day'+(r.days==1?'':'s'):'Overtime · '+r.hours+' hrs'}</td><td>${r.start_date}${r.end_date&&r.end_date!==r.start_date?' → '+r.end_date:''}${r.half_day?' (half day)':''}</td><td>${esc(r.reason)}</td><td>${stTag(r.status)}</td><td>${r.tl_at?esc(r.tl_by)+': '+esc(r.tl_comment||'—'):''}</td><td>${r.hr_at?esc(r.hr_by)+': '+esc(r.hr_comment||'—'):''}</td></tr>`).join('')||'<tr><td colspan=7>None</td></tr>'}</table>`;
@@ -208,6 +232,7 @@ app.post('/approvals/:id',(req,res)=>{const u=req.session.user,r=get(RQ+' where 
  else{run('update requests set status=?,hr_by=?,hr_comment=?,hr_at=? where id=?',[ok?'approved':'rejected',u.name,c,now,r.id]);if(ok)applyApproved(r)}res.redirect('/approvals')});
 // settings & users (admin)
 app.get('/settings',admin,(req,res)=>{const u=all('select id,username,name,role from users');res.send(page(req,'Settings',`<div class=card><h3>Currency</h3><form method=post action=/settings class=f><input name=currency value="${esc(cur())}" placeholder="PKR, USD..."><button>Save</button></form></div>
+<div class=card><h3>Backup</h3><p>Download a full copy of the database (all employees, payroll, attendance, users). Keep it somewhere safe and private.</p><a class=btn href=/backup>Download backup</a></div>
 <div class=card><h3>Leave types &amp; yearly allowances</h3><form method=post action=/settings/leave><table><tr><th>Type</th><th>Days / year</th><th>Paid</th></tr>${all('select * from leave_types').map(l=>`<tr><td><input name=n_${l.id} value="${esc(l.name)}"></td><td><input type=number step=0.5 name=a_${l.id} value=${l.allowance}></td><td><select name=p_${l.id}><option value=1>Paid</option><option value=0 ${l.paid?'':'selected'}>Unpaid (deducted)</option></select></td></tr>`).join('')}</table><br><button>Save leave types</button><small> · Unpaid leave has no cap (allowance 0 = unlimited).</small></form></div>
 <div class=card><h3>Pay rules</h3><form method=post action=/settings/pay class=f><div><label>Working days / month</label><input type=number step=any name=working_days value="${num('working_days')}"></div><div><label>Hours / day</label><input type=number step=any name=hours_per_day value="${num('hours_per_day')}"></div><div><label>Overtime multiplier (× hourly)</label><input type=number step=any name=ot_multiplier value="${num('ot_multiplier')}"></div><div><button>Save</button></div></form></div>
 <div class=card><h3>Income tax slabs (annual, salaried)</h3><form method=post action=/settings/tax><p><small>One slab per line as <b>threshold:rate%</b>, the rate applies to income above the threshold up to the next one. Default = Pakistan FY2025-26 (Tax Year 2026, Finance Act 2025).</small></p><textarea name=tax_slabs rows=7 style="font-family:monospace;max-width:300px">${esc(setting('tax_slabs'))}</textarea><div class=f><div><label>Surcharge above annual income</label><input type=number name=surcharge_threshold value="${num('surcharge_threshold')}"></div><div><label>Surcharge % of tax</label><input type=number step=any name=surcharge_rate value="${num('surcharge_rate')}"></div><div><button>Save slabs</button> <button class="btn m" name=reset value=1>Reset to FY2025-26</button></div></div></form>
@@ -217,4 +242,4 @@ app.get('/settings',admin,(req,res)=>{const u=all('select id,username,name,role 
 app.post('/settings',admin,(req,res)=>{run("insert or replace into settings values('currency',?)",[(req.body.currency||'PKR').trim()]);res.redirect('/settings')});
 app.post('/users',admin,(req,res)=>{try{run('insert into users(username,password_hash,role,name,must_change) values(?,?,?,?,1)',[req.body.username,bcrypt.hashSync(req.body.password,10),req.body.role==='admin'?'admin':'manager',req.body.name])}catch(e){}res.redirect('/settings')});
 app.post('/password',(req,res)=>{run('update users set password_hash=? where id=?',[bcrypt.hashSync(req.body.password,10),req.session.user.id]);res.redirect('/settings')});
-initSqlJs().then(S=>{db=fs.existsSync(DB_FILE)?new S.Database(fs.readFileSync(DB_FILE)):new S.Database();schema();app.listen(PORT,'0.0.0.0',()=>console.log('RevUp Global HRM on http://localhost:'+PORT))});
+initSqlJs().then(S=>{db=fs.existsSync(DB_FILE)?new S.Database(fs.readFileSync(DB_FILE)):new S.Database();schema();app.listen(PORT,'0.0.0.0',()=>console.log(`RevUp Global HRM (${PROD?'production':'development'}) on port ${PORT}, db ${DB_FILE}`))});
